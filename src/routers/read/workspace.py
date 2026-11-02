@@ -12,6 +12,24 @@ from pydantic import BaseModel
 from sqlalchemy import false as sa_false
 
 from ._shared import *  # noqa: F401,F403 — imports + helpers + router
+from ._shared import (  # noqa: F401 — perf 代码显式引用这些名,避免 star 的 F405 噪声
+    AnalyticsScope,
+    Ledger,
+    ReadTxProjection,
+    Session,
+    SyncChange,
+    User,
+    WorkspaceAccountOut,
+    WorkspaceCategoryOut,
+    _clamp_month_start_day,
+    _to_utc,
+    datetime,
+    func,
+    select,
+    timedelta,
+)
+from typing import Any
+
 from ...models import ExchangeRateCache, UserExchangeRateProjection
 from ... import workspace_stats_cache
 
@@ -588,7 +606,6 @@ def list_workspace_accounts(
 ) -> list[WorkspaceAccountOut]:
     is_admin = _is_admin(current_user)
 
-    # --- 1. 从 snapshot 聚合账户（手机同步写入的数据，已排除软删账本 issue #31） ---
     ledgers = _visible_workspace_ledgers(
         db, current_user=current_user, is_admin=is_admin,
         ledger_id=ledger_id, user_id=user_id,
@@ -596,8 +613,48 @@ def list_workspace_accounts(
     if not ledgers:
         return []
     ledger_internal_ids = [l.id for l in ledgers]
-    ledger_meta = {l.id: (l.external_id, _resolve_ledger_name(db, ledger=l)) for l in ledgers}
-    change_id_by_ledger = {l.id: _get_latest_change_id(db, ledger_id=l.id) for l in ledgers}
+    target_user_id = user_id if (is_admin and user_id) else current_user.id
+
+    # 结果按数据版本缓存(同 tags 在 perf1 的模式):缓存排序后完整列表
+    # 的 model_dump 纯数据,key 含目标用户 / 账本集合 / q,不含
+    # limit/offset(切片在缓存外统一做)。
+    version = _workspace_data_version(
+        db,
+        ledger_internal_ids=ledger_internal_ids,
+        user_ids={target_user_id} | {lg.user_id for lg in ledgers},
+    )
+    cache_key = (
+        "accounts",
+        target_user_id,
+        tuple(sorted(ledger_internal_ids)),
+        q or "",
+    )
+    cached = workspace_stats_cache.get(cache_key, version)
+    if cached is not None:
+        return [WorkspaceAccountOut(**row) for row in cached][offset : offset + limit]
+
+    all_accounts = _compute_workspace_accounts(
+        db, ledgers=ledgers, target_user_id=target_user_id, q=q,
+    )
+    workspace_stats_cache.put(
+        cache_key, version, [a.model_dump() for a in all_accounts]
+    )
+    return all_accounts[offset : offset + limit]
+
+
+def _compute_workspace_accounts(
+    db: Session,
+    *,
+    ledgers: list[Ledger],
+    target_user_id: str,
+    q: str | None,
+) -> list[WorkspaceAccountOut]:
+    """accounts 聚合的实际计算,缓存未命中时调用。原端点逻辑原样搬移,
+    返回排序后的完整列表(未切片)。"""
+    # --- 1. 从 snapshot 聚合账户（手机同步写入的数据，已排除软删账本 issue #31） ---
+    ledger_internal_ids = [lg.id for lg in ledgers]
+    ledger_meta = {lg.id: (lg.external_id, _resolve_ledger_name(db, ledger=lg)) for lg in ledgers}
+    change_id_by_ledger = {lg.id: _get_latest_change_id(db, ledger_id=lg.id) for lg in ledgers}
 
     # account 是 **user-global** 实体(Flutter 侧 Accounts 表没 ledger_id),但
     # projection 历史上 per-ledger 重复存(snapshot 每 ledger 各一份)。所以 tx
@@ -666,8 +723,7 @@ def list_workspace_accounts(
         bucket["balance"] = float(bucket["balance"]) + float(amt)
 
     # user-global 重构:account 是 per-user 表,直接按 user_id 拉,不再 per-ledger
-    # 重复存 + dedup。target_user 是 admin 模式下指定的 user_id,否则 caller。
-    target_user_id = user_id if (is_admin and user_id) else current_user.id
+    # 重复存 + dedup。target_user_id 由端点传入(admin 模式下指定,否则 caller)。
     target_email = db.scalar(select(User.email).where(User.id == target_user_id))
 
     # 用户级 last_change_id:该用户最近的 user-scope SyncChange.change_id(account)。
@@ -725,9 +781,9 @@ def list_workspace_accounts(
             )
         )
 
-    # Sort by name, then paginate
+    # Sort by name(分页切片由端点在缓存层外统一做)
     all_accounts.sort(key=lambda a: (a.name or "").lower())
-    return all_accounts[offset : offset + limit]
+    return all_accounts
 
 
 @router.get("/workspace/categories", response_model=list[WorkspaceCategoryOut])
@@ -743,7 +799,6 @@ def list_workspace_categories(
 ) -> list[WorkspaceCategoryOut]:
     is_admin = _is_admin(current_user)
 
-    # --- 1. 从 snapshot 聚合分类（手机同步写入的数据，已排除软删账本 issue #31） ---
     ledgers = _visible_workspace_ledgers(
         db, current_user=current_user, is_admin=is_admin,
         ledger_id=ledger_id, user_id=user_id,
@@ -751,11 +806,50 @@ def list_workspace_categories(
     if not ledgers:
         return []
     ledger_internal_ids = [l.id for l in ledgers]
-    ledger_meta = {l.id: (l.external_id, _resolve_ledger_name(db, ledger=l)) for l in ledgers}
-    change_id_by_ledger = {l.id: _get_latest_change_id(db, ledger_id=l.id) for l in ledgers}
-
     # user-global 重构:category 是 per-user 表。target_user 跟 accounts 一致。
     target_user_id = user_id if (is_admin and user_id) else current_user.id
+
+    # 结果按数据版本缓存(同 tags / accounts 的模式):缓存排序后完整
+    # 列表的 model_dump 纯数据,key 含目标用户 / 账本集合 / q,不含
+    # limit/offset(切片在缓存外统一做)。
+    version = _workspace_data_version(
+        db,
+        ledger_internal_ids=ledger_internal_ids,
+        user_ids={target_user_id} | {lg.user_id for lg in ledgers},
+    )
+    cache_key = (
+        "categories",
+        target_user_id,
+        tuple(sorted(ledger_internal_ids)),
+        q or "",
+    )
+    cached = workspace_stats_cache.get(cache_key, version)
+    if cached is not None:
+        return [WorkspaceCategoryOut(**row) for row in cached][offset : offset + limit]
+
+    all_categories = _compute_workspace_categories(
+        db, ledgers=ledgers, target_user_id=target_user_id, q=q,
+    )
+    workspace_stats_cache.put(
+        cache_key, version, [c.model_dump() for c in all_categories]
+    )
+    return all_categories[offset : offset + limit]
+
+
+def _compute_workspace_categories(
+    db: Session,
+    *,
+    ledgers: list[Ledger],
+    target_user_id: str,
+    q: str | None,
+) -> list[WorkspaceCategoryOut]:
+    """categories 聚合的实际计算,缓存未命中时调用。原端点逻辑原样
+    搬移,返回排序后的完整列表(未切片)。"""
+    # --- 1. 从 snapshot 聚合分类（手机同步写入的数据，已排除软删账本 issue #31） ---
+    ledger_internal_ids = [lg.id for lg in ledgers]
+    ledger_meta = {lg.id: (lg.external_id, _resolve_ledger_name(db, ledger=lg)) for lg in ledgers}
+    change_id_by_ledger = {lg.id: _get_latest_change_id(db, ledger_id=lg.id) for lg in ledgers}
+
     target_email = db.scalar(select(User.email).where(User.id == target_user_id))
 
     # 用户级 last_change_id:该用户最近的 user-scope SyncChange(category)。
@@ -825,9 +919,9 @@ def list_workspace_categories(
             )
         )
 
-    # Sort by kind, sort_order, name, then paginate
+    # Sort by kind, sort_order, name(分页切片由端点在缓存层外统一做)
     all_categories.sort(key=lambda c: (c.kind or "", c.sort_order or 0, (c.name or "").lower()))
-    return all_categories[offset : offset + limit]
+    return all_categories
 
 
 @router.get("/workspace/tags", response_model=list[WorkspaceTagOut])
@@ -1013,25 +1107,68 @@ def workspace_ledger_counts(
             tx_count=0, days_since_first_tx=0, distinct_days=0, first_tx_at=None,
         )
 
-    # COUNT + MIN 一次 SQL 完事
-    row = db.execute(
-        select(
-            func.count(),
-            func.min(ReadTxProjection.happened_at),
-        ).where(ReadTxProjection.ledger_id.in_(ledger_internal_ids))
-    ).one()
-    tx_count = int(row[0] or 0)
-    first_at = _to_utc(row[1]) if row[1] else None
-
-    # distinct days:需要扫 happened_at 列一次(投不出 SQL 抽象,直接 Python)
-    day_set: set[str] = set()
-    if tx_count > 0:
-        for (ts,) in db.execute(
-            select(ReadTxProjection.happened_at)
-            .where(ReadTxProjection.ledger_id.in_(ledger_internal_ids))
-        ).all():
-            if ts:
-                day_set.add(_to_utc(ts).strftime("%Y-%m-%d"))
+    # (tx_count, distinct_days, first_tx_at) 按数据版本缓存(同 analytics /
+    # tags 的 workspace_stats_cache);days_since_first_tx 随「今天」变,
+    # 不进缓存,每次现算。
+    version = _workspace_data_version(
+        db,
+        ledger_internal_ids=ledger_internal_ids,
+        user_ids={current_user.id} | {lg.user_id for lg in ledgers},
+    )
+    cache_key = (
+        "ledger-counts",
+        current_user.id,
+        tuple(sorted(ledger_internal_ids)),
+    )
+    cached = workspace_stats_cache.get(cache_key, version)
+    if cached is not None:
+        tx_count = int(cached["tx_count"])
+        distinct_days = int(cached["distinct_days"])
+        first_at = cached["first_tx_at"]
+    else:
+        # distinct_days 原实现是把全部 happened_at 拉回 Python 逐个
+        # _to_utc 后 strftime 建 set —— 注意口径是 **UTC 日期**(不按
+        # tz_offset 平移),与 analytics 的 distinct_days(本地日期)不同,
+        # 这里按原口径等价改写,不顺手「修正」。
+        # SQLite(生产方言):COUNT + MIN + COUNT(DISTINCT strftime) 一条
+        # SQL 完事 —— happened_at 存的是 UTC 文本,无修饰符的 strftime
+        # 取到的正是 UTC 日期。其它方言没有等价且与会话时区无关的
+        # 现成表达式,保留原 Python 集合算法(结果由缓存兜住重复调用)。
+        if db.get_bind().dialect.name == "sqlite":
+            row = db.execute(
+                select(
+                    func.count(),
+                    func.min(ReadTxProjection.happened_at),
+                    func.count(func.distinct(func.strftime(
+                        "%Y-%m-%d", ReadTxProjection.happened_at))),
+                ).where(ReadTxProjection.ledger_id.in_(ledger_internal_ids))
+            ).one()
+            tx_count = int(row[0] or 0)
+            first_at = _to_utc(row[1]) if row[1] else None
+            distinct_days = int(row[2] or 0)
+        else:
+            row = db.execute(
+                select(
+                    func.count(),
+                    func.min(ReadTxProjection.happened_at),
+                ).where(ReadTxProjection.ledger_id.in_(ledger_internal_ids))
+            ).one()
+            tx_count = int(row[0] or 0)
+            first_at = _to_utc(row[1]) if row[1] else None
+            day_set: set[str] = set()
+            if tx_count > 0:
+                for (ts,) in db.execute(
+                    select(ReadTxProjection.happened_at)
+                    .where(ReadTxProjection.ledger_id.in_(ledger_internal_ids))
+                ).all():
+                    if ts:
+                        day_set.add(_to_utc(ts).strftime("%Y-%m-%d"))
+            distinct_days = len(day_set)
+        workspace_stats_cache.put(cache_key, version, {
+            "tx_count": tx_count,
+            "distinct_days": distinct_days,
+            "first_tx_at": first_at,
+        })
 
     days_since_first_tx = 0
     if first_at is not None:
@@ -1043,7 +1180,7 @@ def workspace_ledger_counts(
     return WorkspaceLedgerCountsOut(
         tx_count=tx_count,
         days_since_first_tx=days_since_first_tx,
-        distinct_days=len(day_set),
+        distinct_days=distinct_days,
         first_tx_at=first_at,
     )
 
@@ -1183,12 +1320,190 @@ def _compute_analytics_aggregation(
     tz_offset_minutes: int,
     month_start_day: int,
 ) -> dict[str, Any]:
-    """analytics 的聚合本体:全表扫 projection 逐行累加,缓存未命中时调用。
+    """analytics 的聚合本体(缓存未命中时调用),返回纯数据 dict。
+
+    SQLite 走 SQL 聚合(见 ``_compute_analytics_aggregation_sqlite``),
+    其它方言 / SQL 路径自检不过时回退 Python 逐行累加
+    (``_compute_analytics_aggregation_python``)。两条路径口径等价,
+    bench2 对 2.2 万笔合成数据逐项对照过。
+    """
+    if ledger_internal_ids:
+        try:
+            dialect_name = db.get_bind().dialect.name
+        except Exception:
+            dialect_name = None
+        if dialect_name == "sqlite":
+            agg = _compute_analytics_aggregation_sqlite(
+                db,
+                ledger_internal_ids=ledger_internal_ids,
+                scope=scope,
+                start_at=start_at,
+                end_at=end_at,
+                tz_offset_minutes=tz_offset_minutes,
+                month_start_day=month_start_day,
+            )
+            if agg is not None:
+                return agg
+    return _compute_analytics_aggregation_python(
+        db,
+        ledger_internal_ids=ledger_internal_ids,
+        scope=scope,
+        start_at=start_at,
+        end_at=end_at,
+        tz_offset_minutes=tz_offset_minutes,
+        month_start_day=month_start_day,
+    )
+
+
+def _compute_analytics_aggregation_sqlite(
+    db: Session,
+    *,
+    ledger_internal_ids: list[str],
+    scope: AnalyticsScope,
+    start_at: datetime | None,
+    end_at: datetime | None,
+    tz_offset_minutes: int,
+    month_start_day: int,
+) -> dict[str, Any] | None:
+    """analytics 聚合的 SQLite SQL 版:把逐行累加下推成 4 条 GROUP BY 查询。
+
+    前提(已在合成库实证):happened_at 经 SQLAlchemy 存成 UTC 文本
+    ``YYYY-MM-DD HH:MM:SS.ffffff``(无时区后缀),所以 SQLite 的 datetime /
+    strftime 修饰符能直接对上 Python 侧 ``_to_utc + timedelta`` 的口径:
+    - 本地时刻 = happened_at 按 ``tz_offset_minutes`` 平移;
+    - scope=month 分桶 = 本地日期 ``%Y-%m-%d``;
+    - year/all 分桶 = 本地时刻再减 (month_start_day-1) 天取 ``%Y-%m``,
+      与 ``_bucket_key`` 的「day >= start_day 归当月、否则归上月」等价
+      (month_start_day 已被 ``_clamp_month_start_day`` 钳到 [1,28])。
+    修饰符字符串只由服务端校验过的 int 拼成(时区范围 [-720,840]、
+    起始日 [1,28]),不是外部输入直拼。
+
+    自检:若范围内有 happened_at 非 NULL 但 datetime() 解析不了的行
+    (异常存储格式),返回 None 让调用方回退 Python 路径,不静默算错。
+    """
+    from sqlalchemy import case as sa_case
+    from sqlalchemy import literal_column
+
+    col = ReadTxProjection.happened_at
+    amt = func.coalesce(ReadTxProjection.native_amount, ReadTxProjection.amount)
+    tz_lit = literal_column(f"'{int(tz_offset_minutes):+d} minutes'")
+    conds = [
+        ReadTxProjection.ledger_id.in_(ledger_internal_ids),
+        ReadTxProjection.exclude_from_stats == sa_false(),
+        col.is_not(None),
+    ]
+    if start_at is not None:
+        conds.append(col >= start_at)
+    if end_at is not None:
+        conds.append(col < end_at)
+
+    bad = db.scalar(
+        select(func.count()).where(*conds, func.datetime(col).is_(None))
+    )
+    if bad:
+        return None
+
+    if scope == "month":
+        bucket = func.strftime("%Y-%m-%d", col, tz_lit)
+    else:
+        shift = _clamp_month_start_day(month_start_day) - 1
+        bucket = func.strftime(
+            "%Y-%m", col, tz_lit, literal_column(f"'{-shift:+d} days'")
+        )
+
+    tot = db.execute(
+        select(
+            func.count(),
+            func.coalesce(func.sum(sa_case(
+                (ReadTxProjection.tx_type == "income", amt), else_=0.0)), 0.0),
+            func.coalesce(func.sum(sa_case(
+                (ReadTxProjection.tx_type == "expense", amt), else_=0.0)), 0.0),
+            func.min(col),
+            func.max(col),
+            func.count(func.distinct(
+                func.strftime("%Y-%m-%d", col, tz_lit))),
+        ).where(*conds)
+    ).one()
+
+    # series:transfer 等非收支行也要建桶(Python 路径先建 slot 再按 type
+    # 分流),所以这里不能按 tx_type 过滤,金额用条件 SUM。
+    series_map: dict[str, dict[str, float]] = {}
+    for b, inc, exp in db.execute(
+        select(
+            bucket,
+            func.coalesce(func.sum(sa_case(
+                (ReadTxProjection.tx_type == "income", amt), else_=0.0)), 0.0),
+            func.coalesce(func.sum(sa_case(
+                (ReadTxProjection.tx_type == "expense", amt), else_=0.0)), 0.0),
+        ).where(*conds).group_by(bucket)
+    ).all():
+        if b is not None:
+            series_map[b] = {"income": float(inc), "expense": float(exp)}
+
+    # category:Python 是 ``(name or "").strip() or "Uncategorized"``;
+    # SQLite trim 只去 ASCII 空格(分类名带 tab/换行的极端情况口径略异,
+    # 已知并接受,见 RESULTS2)。只统计 income/expense(其余 type 在
+    # Python 路径里 continue,不会进 category_map)。
+    cat_expr = sa_case(
+        (func.trim(func.coalesce(ReadTxProjection.category_name, "")) == "",
+         "Uncategorized"),
+        else_=func.trim(ReadTxProjection.category_name),
+    )
+    category_map: dict[str, dict[str, float]] = {}
+    for name, cnt, inc, exp in db.execute(
+        select(
+            cat_expr,
+            func.count(),
+            func.coalesce(func.sum(sa_case(
+                (ReadTxProjection.tx_type == "income", amt), else_=0.0)), 0.0),
+            func.coalesce(func.sum(sa_case(
+                (ReadTxProjection.tx_type == "expense", amt), else_=0.0)), 0.0),
+        ).where(*conds, ReadTxProjection.tx_type.in_(["income", "expense"]))
+        .group_by(cat_expr)
+    ).all():
+        category_map[name] = {
+            "income": float(inc), "expense": float(exp), "count": float(cnt),
+        }
+
+    category_by_bucket: dict[str, dict[str, float]] = {}
+    for b, name, total in db.execute(
+        select(bucket, cat_expr, func.coalesce(func.sum(amt), 0.0))
+        .where(*conds, ReadTxProjection.tx_type == "expense")
+        .group_by(bucket, cat_expr)
+    ).all():
+        if b is not None:
+            category_by_bucket.setdefault(b, {})[name] = float(total)
+
+    return {
+        "transaction_count": int(tot[0] or 0),
+        "income_total": float(tot[1] or 0.0),
+        "expense_total": float(tot[2] or 0.0),
+        "series_map": series_map,
+        "category_map": category_map,
+        "category_by_bucket": category_by_bucket,
+        "distinct_days": int(tot[5] or 0),
+        "first_tx_at": _to_utc(tot[3]) if tot[3] else None,
+        "last_tx_at": _to_utc(tot[4]) if tot[4] else None,
+    }
+
+
+def _compute_analytics_aggregation_python(
+    db: Session,
+    *,
+    ledger_internal_ids: list[str],
+    scope: AnalyticsScope,
+    start_at: datetime | None,
+    end_at: datetime | None,
+    tz_offset_minutes: int,
+    month_start_day: int,
+) -> dict[str, Any]:
+    """analytics 聚合的 Python 版:全表扫 projection 逐行累加。
 
     返回纯数据 dict(summary 所需量 + series_map + category_map(income 与
     expense 双份都留) + category_by_bucket + distinct_days 计数 + first /
     last 时间),端点每次用它重新组装响应,不含任何 Pydantic 对象。
-    原端点逻辑原样搬移,口径不变。
+    原端点逻辑原样搬移,口径不变。非 SQLite 方言与 SQL 路径自检
+    回退时走这里。
     """
     transaction_count = 0
     income_total = 0.0
