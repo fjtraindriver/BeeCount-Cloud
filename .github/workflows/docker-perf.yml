@@ -15,7 +15,7 @@ on:
   workflow_dispatch:
 
 env:
-  PERF_VERSION: "1.9.0-perf2"
+  PERF_VERSION: "1.9.0-perf3"
   IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/beecount-cloud
 
 jobs:
