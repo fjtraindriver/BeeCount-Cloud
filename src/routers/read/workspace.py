@@ -23,8 +23,10 @@ from ._shared import (  # noqa: F401 — perf 代码显式引用这些名,避免
     WorkspaceCategoryOut,
     _clamp_month_start_day,
     _to_utc,
+    and_,
     datetime,
     func,
+    or_,
     select,
     timedelta,
 )
@@ -1047,6 +1049,19 @@ def _compute_workspace_tags(
         ).where(
             ReadTxProjection.ledger_id.in_(ledger_internal_ids),
             ReadTxProjection.exclude_from_stats == sa_false(),
+            # 只拉带标签的行:两个标签字段都空的行在下面的匹配里必然是
+            # 空集,拉进 Python 逐行解析纯属浪费(真实账本里无标签交易
+            # 占多数)。空字符串同理(解析为空/跳过),一并过滤。
+            or_(
+                and_(
+                    ReadTxProjection.tag_sync_ids_json.is_not(None),
+                    ReadTxProjection.tag_sync_ids_json != "",
+                ),
+                and_(
+                    ReadTxProjection.tags_csv.is_not(None),
+                    ReadTxProjection.tags_csv != "",
+                ),
+            ),
         )
     ).all()
     for tx_type_val, amount, tag_ids_json, tags_csv in tx_rows:
@@ -1710,6 +1725,48 @@ def workspace_net_worth_history(
     ledger_internal_ids = [l.id for l in ledgers]
     if not ledger_internal_ids:
         return NetWorthHistoryOut(series=[], multi_currency=False)
+
+    # 聚合结果按数据版本缓存(同 analytics/tags 模式):本端点要把可见账本
+    # 的全部交易按时间回放重算每月净值,是 /workspace 里最后一个没缓存的
+    # 全表聚合。输入覆盖:交易走 ledger-scope、账户/汇率 override 走
+    # user-scope(见 _workspace_data_version),版本不变才命中;汇率自动
+    # 缓存刷新、主币种设置这类不写 SyncChange 的改动由 300 秒 TTL 兜底
+    # (与其它聚合端点同等口径,含跨月时补齐到当前月的点最多迟 5 分钟)。
+    version = _workspace_data_version(
+        db,
+        ledger_internal_ids=ledger_internal_ids,
+        user_ids={current_user.id} | {lg.user_id for lg in ledgers},
+    )
+    cache_key = (
+        "net-worth-history",
+        current_user.id,
+        tuple(sorted(ledger_internal_ids)),
+        tz_offset_minutes,
+    )
+    cached = workspace_stats_cache.get(cache_key, version)
+    if cached is not None:
+        return NetWorthHistoryOut(**cached)
+
+    result = _compute_net_worth_history(
+        db, ledgers=ledgers, current_user=current_user,
+        tz_offset_minutes=tz_offset_minutes,
+    )
+    workspace_stats_cache.put(cache_key, version, result.model_dump())
+    return result
+
+
+def _compute_net_worth_history(
+    db: Session,
+    *,
+    ledgers: list[Ledger],
+    current_user: User,
+    tz_offset_minutes: int,
+) -> NetWorthHistoryOut:
+    """net-worth-history 的实际计算(全量回放 projection),缓存未命中时调用。
+
+    原端点逻辑原样搬移,口径不变。
+    """
+    ledger_internal_ids = [lg.id for lg in ledgers]
 
     accts = db.execute(
         select(
