@@ -1,6 +1,8 @@
 import logging
 from pathlib import Path
 
+from starlette.middleware.gzip import GZipMiddleware
+
 # !!! 顺序关键 !!!
 # 必须在**任何** `from .routers ...` 之前把 JWT 密钥灌进 env。部分 router
 # 模块(write.py)顶层有 `settings = get_settings()`,`get_settings` 是
@@ -122,6 +124,16 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# JSON 读接口的响应动辄几十 kB(分类/标签/统计),gzip 后传输量降一个
+# 量级,弱网与反代链路下体感明显。安全性已按 Starlette 1.10 的实现核对:
+# - 非 http scope 直接放行 → WebSocket(/sync 的 WS 通道)不受影响;
+# - 默认排除名单含 text/event-stream → AI 问答与导入进度的 SSE 流
+#   不压缩、不缓冲,逐字/逐行推送语义不变;
+# - MCP Streamable HTTP 的普通 JSON 响应会被压缩,标准客户端(httpx)
+#   透明解压;其 SSE 流同上被排除;
+# - 响应体 < 1024 字节不压缩,小接口零额外开销。
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 
 @app.get("/healthz")
