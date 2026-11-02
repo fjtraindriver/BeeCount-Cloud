@@ -158,17 +158,86 @@ async function authedFetch(makeRequest: FetchMaker, token: string): Promise<Resp
   }
 }
 
-export async function authedGet<T>(path: string, token: string): Promise<T> {
-  const res = await authedFetch(
+// ---------------------------------------------------------------------------
+// /read GET 短缓存 + in-flight 合并
+// ---------------------------------------------------------------------------
+//
+// 背景:全仓十几个组件在各自挂载时独立拉 accounts / categories / tags /
+// transactions,同一页面一次打开能发出十几个请求,其中不少 URL 完全相同
+// (如 accounts?limit=500 被拉 3 次)。此前 authedGet 显式 cache:'no-store',
+// 是担心 refresh-after-write 看到上一份数据 —— 那个担心成立,所以这里
+// 不是无条件缓存,而是带三重保险的短缓存:
+//   1. 只缓存路径以 /read/ 开头的 GET(写接口的 GET、/admin、/ai 等不碰);
+//   2. TTL 只有 20 秒,且任何非 GET 的 authed 请求(POST/PATCH/PUT/
+//      DELETE)成功后立刻清空 —— 写完再读永远走网络,原担心的场景不出现;
+//   3. token 一变就清空,登出/换号不会串数据。
+// 并发同 URL+token 的请求合并为一个 in-flight promise。缓存里存的是
+// JSON 序列化字符串,每次命中都 JSON.parse 出新对象,调用方互改不脏。
+// 错误响应(含最终 401)走 parseResponse 抛错路径,不会被缓存。
+
+const READ_CACHE_TTL_MS = 20_000
+const READ_CACHE_MAX_ENTRIES = 200
+
+const readCache = new Map<string, { at: number; body: string }>()
+const readInflight = new Map<string, Promise<string | undefined>>()
+let readCacheToken: string | null = null
+
+export function clearReadCache(): void {
+  readCache.clear()
+  readInflight.clear()
+}
+
+function isCacheableReadPath(path: string): boolean {
+  return path.startsWith('/read/')
+}
+
+async function fetchAuthedGet(path: string, token: string): Promise<Response> {
+  return authedFetch(
     (tok) =>
       fetch(`${API_BASE}${path}`, {
         headers: authHeaders(tok),
-        // 数据是事件日志 + 最新快照驱动的，任何缓存命中都会让 refresh-after-write
-        // 看到上一份数据。显式拒绝，避免浏览器/中间 CDN 给同路径返回旧响应。
+        // 浏览器/中间 CDN 层仍然拒绝缓存(见上方说明:这里的短缓存是
+        // 应用层自己管失效的,跟 HTTP 缓存是两回事)。
         cache: 'no-store'
       }),
     token
   )
+}
+
+async function authedGetCached<T>(path: string, token: string): Promise<T> {
+  if (readCacheToken !== token) {
+    readCacheToken = token
+    clearReadCache()
+  }
+  const hit = readCache.get(path)
+  if (hit && Date.now() - hit.at < READ_CACHE_TTL_MS) {
+    return JSON.parse(hit.body) as T
+  }
+  let inflight = readInflight.get(path)
+  if (!inflight) {
+    inflight = (async () => {
+      const res = await fetchAuthedGet(path, token)
+      const value = await parseResponse<unknown>(res)
+      const body = JSON.stringify(value) as string | undefined
+      if (body !== undefined) {
+        if (readCache.size >= READ_CACHE_MAX_ENTRIES) readCache.clear()
+        readCache.set(path, { at: Date.now(), body })
+      }
+      return body
+    })().finally(() => {
+      readInflight.delete(path)
+    })
+    readInflight.set(path, inflight)
+  }
+  const body = await inflight
+  return (body === undefined ? undefined : JSON.parse(body)) as T
+}
+
+export async function authedGet<T>(path: string, token: string): Promise<T> {
+  if (isCacheableReadPath(path)) {
+    return authedGetCached<T>(path, token)
+  }
+  const res = await fetchAuthedGet(path, token)
   return parseResponse<T>(res)
 }
 
@@ -190,7 +259,9 @@ export async function authedPost<T>(
       }),
     token
   )
-  return parseResponse<T>(res)
+  const value = await parseResponse<T>(res)
+  clearReadCache()
+  return value
 }
 
 export async function authedPatch<T>(path: string, token: string, body: unknown): Promise<T> {
@@ -206,7 +277,9 @@ export async function authedPatch<T>(path: string, token: string, body: unknown)
       }),
     token
   )
-  return parseResponse<T>(res)
+  const value = await parseResponse<T>(res)
+  clearReadCache()
+  return value
 }
 
 export async function authedPut<T>(path: string, token: string, body: unknown): Promise<T> {
@@ -222,7 +295,9 @@ export async function authedPut<T>(path: string, token: string, body: unknown): 
       }),
     token
   )
-  return parseResponse<T>(res)
+  const value = await parseResponse<T>(res)
+  clearReadCache()
+  return value
 }
 
 export async function authedDelete<T>(path: string, token: string, body?: unknown): Promise<T> {
@@ -241,5 +316,7 @@ export async function authedDelete<T>(path: string, token: string, body?: unknow
       }),
     token
   )
-  return parseResponse<T>(res)
+  const value = await parseResponse<T>(res)
+  clearReadCache()
+  return value
 }
