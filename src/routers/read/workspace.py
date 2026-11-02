@@ -13,6 +13,7 @@ from sqlalchemy import false as sa_false
 
 from ._shared import *  # noqa: F401,F403 — imports + helpers + router
 from ...models import ExchangeRateCache, UserExchangeRateProjection
+from ... import workspace_stats_cache
 
 # ---------------------------------------------------------------------------
 # 净值历史 — 响应 schema
@@ -28,6 +29,47 @@ class NetWorthHistorySeriesItemOut(BaseModel):
 class NetWorthHistoryOut(BaseModel):
     series: list[NetWorthHistorySeriesItemOut]
     multi_currency: bool
+
+
+# ---------------------------------------------------------------------------
+# 聚合统计缓存(analytics / tags)的数据版本
+# ---------------------------------------------------------------------------
+
+def _workspace_data_version(
+    db: Session,
+    *,
+    ledger_internal_ids: list[str],
+    user_ids: set[str],
+) -> tuple[int, int]:
+    """聚合结果的失效校验版本:(ledger-scope 最大 change_id, user-scope 最大 change_id)。
+
+    正常写路径(同步 push / Web 写 / CSV 导入 / 汇率 override)落 projection
+    时同事务必写 SyncChange:交易/账本类改动走 ledger-scope,分类/标签/账户/
+    汇率等 user-global 改动走 user-scope。两个 MAX 都走现成索引
+    (idx_sync_changes_ledger_cursor / idx_sync_changes_user_scope_cursor),
+    每次调用只是两次索引尾读,相对全表聚合可忽略。
+
+    user_ids 要覆盖所有能改到本次聚合输入的用户:调用者本人 + 可见账本的
+    owner(共享账本里 owner 改分类名/汇率会改到 editor 视角的聚合输入)。
+    可见账本集合本身由调用方放进缓存 key,集合增减天然换 key,不靠版本。
+    """
+    ledger_part = 0
+    if ledger_internal_ids:
+        ledger_part = int(db.scalar(
+            select(func.coalesce(func.max(SyncChange.change_id), 0)).where(
+                SyncChange.ledger_id.in_(ledger_internal_ids),
+                SyncChange.scope == "ledger",
+            )
+        ) or 0)
+    user_part = 0
+    if user_ids:
+        user_part = int(db.scalar(
+            select(func.coalesce(func.max(SyncChange.change_id), 0)).where(
+                SyncChange.user_id.in_(sorted(user_ids)),
+                SyncChange.scope == "user",
+            )
+        ) or 0)
+    return (ledger_part, user_part)
 
 @router.get("/workspace/transactions", response_model=WorkspaceTransactionPageOut)
 def list_workspace_transactions(
@@ -801,18 +843,57 @@ def list_workspace_tags(
 ) -> list[WorkspaceTagOut]:
     is_admin = _is_admin(current_user)
 
-    # --- 1. 从 snapshot 聚合标签（手机同步写入的数据，已排除软删账本 issue #31） ---
     ledgers = _visible_workspace_ledgers(
         db, current_user=current_user, is_admin=is_admin,
         ledger_id=ledger_id, user_id=user_id,
     )
+    target_user_id = user_id if (is_admin and user_id) else current_user.id
 
+    # 聚合要全表扫 projection,结果按数据版本缓存(见 workspace_stats_cache)。
+    # key 不含 limit/offset:缓存的是排序后的完整列表,切片在两条路径上统一做。
+    # q 会改变标签集合与统计口径,必须进 key。
+    ledger_internal_ids = [lg.id for lg in ledgers]
+    version = _workspace_data_version(
+        db,
+        ledger_internal_ids=ledger_internal_ids,
+        user_ids={target_user_id} | {lg.user_id for lg in ledgers},
+    )
+    cache_key = (
+        "tags",
+        target_user_id,
+        tuple(sorted(ledger_internal_ids)),
+        q or "",
+    )
+    cached = workspace_stats_cache.get(cache_key, version)
+    if cached is not None:
+        return [WorkspaceTagOut(**row) for row in cached][offset : offset + limit]
+
+    all_tags = _compute_workspace_tags(
+        db, ledgers=ledgers, target_user_id=target_user_id, q=q,
+    )
+    workspace_stats_cache.put(
+        cache_key, version, [t.model_dump() for t in all_tags]
+    )
+    return all_tags[offset : offset + limit]
+
+
+def _compute_workspace_tags(
+    db: Session,
+    *,
+    ledgers: list[Ledger],
+    target_user_id: str,
+    q: str | None,
+) -> list[WorkspaceTagOut]:
+    """tags 聚合的实际计算(全表扫 projection 逐行匹配),缓存未命中时调用。
+
+    返回排序后的完整列表(未切片)。原端点逻辑原样搬移,口径不变。
+    """
+    # --- 1. 从 snapshot 聚合标签（手机同步写入的数据，已排除软删账本 issue #31） ---
     all_tags: list[WorkspaceTagOut] = []
     # user-global 重构:tag 是 per-user。即便用户无 ledger,标签仍可存在(协议层
     # 允许);但 tx 聚合需要 ledger 才有意义,所以 stats 阶段空集即可。
     ledger_internal_ids = [l.id for l in ledgers]
 
-    target_user_id = user_id if (is_admin and user_id) else current_user.id
     target_email = db.scalar(select(User.email).where(User.id == target_user_id))
 
     tag_last_change_id = int(db.scalar(
@@ -907,7 +988,7 @@ def list_workspace_tags(
             e.income_total = float(s["income"])
 
     all_tags.sort(key=lambda t: (t.name or "").lower())
-    return all_tags[offset : offset + limit]
+    return all_tags
 
 
 @router.get("/workspace/ledger-counts", response_model=WorkspaceLedgerCountsOut)
@@ -998,6 +1079,117 @@ def workspace_analytics(
     )
     ledger_internal_ids = [l.id for l in ledgers]
 
+    # 聚合本体与 metric 无关(year 的 expense/income 是同一套计算),按数据
+    # 版本缓存聚合结果,metric 只在下面组装 category_ranks 时用。range 的
+    # 起止由 (scope, period, tz, month_start_day) 决定,把这些原始参数放进
+    # key,避免不同时区/起始日的请求串数。
+    version = _workspace_data_version(
+        db,
+        ledger_internal_ids=ledger_internal_ids,
+        user_ids={current_user.id} | {lg.user_id for lg in ledgers},
+    )
+    cache_key = (
+        "analytics",
+        current_user.id,
+        tuple(sorted(ledger_internal_ids)),
+        scope,
+        normalized_period or "",
+        tz_offset_minutes,
+        month_start_day,
+    )
+    agg = workspace_stats_cache.get(cache_key, version)
+    if agg is None:
+        agg = _compute_analytics_aggregation(
+            db,
+            ledger_internal_ids=ledger_internal_ids,
+            scope=scope,
+            start_at=start_at,
+            end_at=end_at,
+            tz_offset_minutes=tz_offset_minutes,
+            month_start_day=month_start_day,
+        )
+        workspace_stats_cache.put(cache_key, version, agg)
+    transaction_count = agg["transaction_count"]
+    income_total = agg["income_total"]
+    expense_total = agg["expense_total"]
+    series_map = agg["series_map"]
+    category_map = agg["category_map"]
+    category_by_bucket = agg["category_by_bucket"]
+    distinct_days = agg["distinct_days"]
+    first_tx_at = agg["first_tx_at"]
+    last_tx_at = agg["last_tx_at"]
+
+    series = [
+        WorkspaceAnalyticsSeriesItemOut(
+            bucket=bucket,
+            expense=slot["expense"],
+            income=slot["income"],
+            balance=slot["income"] - slot["expense"],
+        )
+        for bucket, slot in sorted(series_map.items(), key=lambda x: x[0])
+    ]
+
+    category_ranks: list[WorkspaceAnalyticsCategoryRankOut] = []
+    if metric != "balance":
+        metric_key = "income" if metric == "income" else "expense"
+        category_ranks = [
+            WorkspaceAnalyticsCategoryRankOut(
+                category_name=category_name,
+                total=float(values[metric_key]),
+                tx_count=int(values["count"]),
+            )
+            for category_name, values in category_map.items()
+            if float(values[metric_key]) > 0
+        ]
+        category_ranks.sort(key=lambda row: (-row.total, row.category_name))
+
+    # 异常月份归因 — 仅 scope=year 算(month/all 没意义,month 只 1 个 bucket,
+    # all 跨年 baseline 抖动太大)。详见
+    # .docs/dashboard-anomaly-budget/plan.md §2.1。
+    anomaly_months: list[WorkspaceAnalyticsAnomalyMonthOut] = []
+    if scope == "year":
+        anomaly_months = _compute_anomaly_months(series, category_by_bucket)
+
+    return WorkspaceAnalyticsOut(
+        summary=WorkspaceAnalyticsSummaryOut(
+            transaction_count=transaction_count,
+            income_total=income_total,
+            expense_total=expense_total,
+            balance=income_total - expense_total,
+            distinct_days=distinct_days,
+            first_tx_at=first_tx_at,
+            last_tx_at=last_tx_at,
+        ),
+        series=series,
+        category_ranks=category_ranks,
+        anomaly_months=anomaly_months,
+        range=WorkspaceAnalyticsRangeOut(
+            scope=scope,
+            metric=metric,
+            period=normalized_period,
+            start_at=start_at,
+            end_at=end_at - timedelta(seconds=1) if end_at is not None else None,
+        ),
+    )
+
+
+def _compute_analytics_aggregation(
+    db: Session,
+    *,
+    ledger_internal_ids: list[str],
+    scope: AnalyticsScope,
+    start_at: datetime | None,
+    end_at: datetime | None,
+    tz_offset_minutes: int,
+    month_start_day: int,
+) -> dict[str, Any]:
+    """analytics 的聚合本体:全表扫 projection 逐行累加,缓存未命中时调用。
+
+    返回纯数据 dict(summary 所需量 + series_map + category_map(income 与
+    expense 双份都留) + category_by_bucket + distinct_days 计数 + first /
+    last 时间),端点每次用它重新组装响应,不含任何 Pydantic 对象。
+    原端点逻辑原样搬移,口径不变。
+    """
     transaction_count = 0
     income_total = 0.0
     expense_total = 0.0
@@ -1068,58 +1260,17 @@ def workspace_analytics(
                 bucket_cat = category_by_bucket.setdefault(bucket, {})
                 bucket_cat[category] = bucket_cat.get(category, 0.0) + amt
 
-    series = [
-        WorkspaceAnalyticsSeriesItemOut(
-            bucket=bucket,
-            expense=slot["expense"],
-            income=slot["income"],
-            balance=slot["income"] - slot["expense"],
-        )
-        for bucket, slot in sorted(series_map.items(), key=lambda x: x[0])
-    ]
-
-    category_ranks: list[WorkspaceAnalyticsCategoryRankOut] = []
-    if metric != "balance":
-        metric_key = "income" if metric == "income" else "expense"
-        category_ranks = [
-            WorkspaceAnalyticsCategoryRankOut(
-                category_name=category_name,
-                total=float(values[metric_key]),
-                tx_count=int(values["count"]),
-            )
-            for category_name, values in category_map.items()
-            if float(values[metric_key]) > 0
-        ]
-        category_ranks.sort(key=lambda row: (-row.total, row.category_name))
-
-    # 异常月份归因 — 仅 scope=year 算(month/all 没意义,month 只 1 个 bucket,
-    # all 跨年 baseline 抖动太大)。详见
-    # .docs/dashboard-anomaly-budget/plan.md §2.1。
-    anomaly_months: list[WorkspaceAnalyticsAnomalyMonthOut] = []
-    if scope == "year":
-        anomaly_months = _compute_anomaly_months(series, category_by_bucket)
-
-    return WorkspaceAnalyticsOut(
-        summary=WorkspaceAnalyticsSummaryOut(
-            transaction_count=transaction_count,
-            income_total=income_total,
-            expense_total=expense_total,
-            balance=income_total - expense_total,
-            distinct_days=len(distinct_days_set),
-            first_tx_at=first_tx_at,
-            last_tx_at=last_tx_at,
-        ),
-        series=series,
-        category_ranks=category_ranks,
-        anomaly_months=anomaly_months,
-        range=WorkspaceAnalyticsRangeOut(
-            scope=scope,
-            metric=metric,
-            period=normalized_period,
-            start_at=start_at,
-            end_at=end_at - timedelta(seconds=1) if end_at is not None else None,
-        ),
-    )
+    return {
+        "transaction_count": transaction_count,
+        "income_total": income_total,
+        "expense_total": expense_total,
+        "series_map": series_map,
+        "category_map": category_map,
+        "category_by_bucket": category_by_bucket,
+        "distinct_days": len(distinct_days_set),
+        "first_tx_at": first_tx_at,
+        "last_tx_at": last_tx_at,
+    }
 
 
 # ---------------------------------------------------------------------------
